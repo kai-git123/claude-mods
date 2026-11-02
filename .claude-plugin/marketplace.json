@@ -1,0 +1,5 @@
+{
+  "name": "my-mods",
+  "owner": { "name": "user" },
+  "plugins": [{ "name": "project-board", "source": "./project-board" }]
+}

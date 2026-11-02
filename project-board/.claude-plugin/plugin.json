@@ -1,0 +1,6 @@
+{
+  "name": "project-board",
+  "version": "0.1.0",
+  "description": "專案看板：以圖示呈現專案架構、目前狀況、待辦與已完成事項的常駐面板",
+  "types": "./types/index.d.ts"
+}
