@@ -264,15 +264,36 @@ const fit = (text: string, units: number): string => {
   return out
 }
 
-type Placed = { node: BoardNode; x: number; y: number; w: number; h: number }
+type Placed = { node: BoardNode; layer: number; x: number; y: number; w: number; h: number }
 
 // A pane's cell is about this many CSS pixels wide on a graphical surface.
 const CELL_PX = 8
 
+// Outer margin, a group's inner margin, and a node's column.
+const PAD = 14
+const INNER = 14
+const NODE_W = 132
+const NODE_GAP = 16
+
+// How many nodes fit side by side in a drawing `width` pixels wide, with
+// `gutter` pixels kept free at the right for links.
+const fitPerRow = (width: number, gutter = 0): number =>
+  Math.max(1, Math.floor((width - 2 * PAD - 2 * INNER - gutter + NODE_GAP) / (NODE_W + NODE_GAP)))
+
 // How many nodes sit side by side in a pane this many cells wide.
-export const nodesPerRow = (columns: number): number => (columns < 50 ? 1 : columns < 90 ? 2 : 3)
+export const nodesPerRow = (columns: number): number =>
+  fitPerRow(Math.max(300, Math.round(columns * CELL_PX)))
 
 const STATUS_TEXT: Record<NodeStatus, string> = { done: '完成', doing: '進行中', todo: '未開始' }
+const STATUS_COLOR: Record<NodeStatus, string> = { done: '#34d399', doing: '#f5a524', todo: '#8a8d96' }
+
+// One color per layer, in order, readable on light and dark.
+const LAYER_COLORS = ['#4f8ef7', '#9b7cf6', '#2fbf8a', '#f0943a', '#e5609a', '#25a9c7']
+const layerColor = (i: number): string => LAYER_COLORS[i % LAYER_COLORS.length]
+
+// A #rrggbb color with an alpha.
+const alpha = (color: string, a: number): string =>
+  color + Math.round(a * 255).toString(16).padStart(2, '0')
 
 // Half-width units of a text: CJK and emoji take two.
 const units = (text: string): number => {
@@ -282,9 +303,21 @@ const units = (text: string): number => {
   return n
 }
 
+// A progress ring around (cx, cy).
+const ring = (cx: number, cy: number, r: number, width: number, part: number, color: string): string => {
+  const length = 2 * Math.PI * r
+
+  return (
+    `<circle class="track" cx="${cx}" cy="${cy}" r="${r}" stroke-width="${width}"/>` +
+    (part > 0
+      ? `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${width}" stroke-linecap="round" stroke-dasharray="${length * part} ${length}" transform="rotate(-90 ${cx} ${cy})"/>`
+      : '')
+  )
+}
+
 type Point = { x: number; y: number }
 
-// Points along a link's curve, to tell whether it passes behind a card.
+// Points along a link's curve, to tell whether it passes behind a node.
 const curvePoints = (p1: Point, c1: Point, c2: Point, p2: Point): Point[] => {
   const out: Point[] = []
   for (let t = 0.04; t < 0.97; t += 0.04) {
@@ -299,7 +332,7 @@ const curvePoints = (p1: Point, c1: Point, c2: Point, p2: Point): Point[] => {
 }
 
 // A path through `pts` in straight legs with rounded corners.
-const elbow = (pts: Point[], radius = 6): string => {
+const elbow = (pts: Point[], radius = 8): string => {
   let d = `M${pts[0].x} ${pts[0].y}`
   for (let i = 1; i < pts.length - 1; i++) {
     const [prev, cur, next] = [pts[i - 1], pts[i], pts[i + 1]]
@@ -316,69 +349,33 @@ const elbow = (pts: Point[], radius = 6): string => {
   return `${d} L${last.x} ${last.y}`
 }
 
-// The curve a link takes between two cards that are not in one row.
+// The curve a link takes between two nodes that are not in one row: from the
+// bottom of the source's text to the top of the target's tile, or back up.
 const linkCurve = (a: Placed, b: Placed): [Point, Point, Point, Point] => {
   const down = b.y > a.y
   const p1 = { x: a.x + a.w / 2, y: down ? a.y + a.h : a.y }
-  const p2 = { x: b.x + b.w / 2, y: down ? b.y - 3 : b.y + b.h + 3 }
+  const p2 = { x: b.x + b.w / 2, y: down ? b.y - 2 : b.y + b.h + 3 }
   const bend = (p2.y - p1.y) / 2
 
   return [p1, { x: p1.x, y: p1.y + bend }, { x: p2.x, y: p2.y - bend }, p2]
 }
 
-// The architecture in the Notion look: a heading per layer with its progress,
-// plain cards with an emoji, a status tag, and thin curved links.
+// The architecture as a system diagram: the project's progress ring at the
+// top, each layer a dashed group with its own color and ring, each node a
+// colored icon tile with a status dot, and curved links in the source's color.
 export function architectureSvg(data: Board, columns = 40): string {
   // Drawn at the pane's own width, so the text keeps its size instead of
   // shrinking with a fixed-width picture.
   const W = Math.max(300, Math.round(columns * CELL_PX))
-  const PER_ROW = nodesPerRow(columns)
-  const PAD = 14
-  const GAP = 10
-  const NODE_H = 92
-  const HEAD_H = 60
-  const LAYER_GAP = 30
-  const cols = (n: number) => Math.max(1, Math.min(PER_ROW, n))
+  const NODE_H = 126
+  const ROW_GAP = 30
+  const HERO_H = 58
+  const GROUP_GAP = 46
+  const TOP_PAD = 30
+  const BOTTOM_PAD = 16
+  const DIP = 22
 
-  // Lays the cards out with `gutter` pixels kept free at the right for links.
-  const build = (gutter: number) => {
-    const nodeW = (W - 2 * PAD - gutter - (PER_ROW - 1) * GAP) / PER_ROW
-    const placed: Placed[] = []
-    const headings: string[] = []
-    let y = PAD
-    for (const layer of data.layers) {
-      const n = layer.nodes.length
-      const rows = Math.max(1, Math.ceil(n / cols(n)))
-      const done = layer.nodes.filter(node => node.status === 'done').length
-      const meta = `${n} 個元件 · ${done}/${n} 完成`
-      const barX = PAD + units(meta) * 6.2 + 14
-      const barW = Math.min(140, W - PAD - gutter - barX)
-      headings.push(
-        `<text class="h" x="${PAD}" y="${y + 20}">${esc(layer.name)}</text>` +
-          `<text class="meta" x="${PAD}" y="${y + 41}">${esc(meta)}</text>` +
-          (barW > 30
-            ? `<rect class="track" x="${barX}" y="${y + 35}" width="${barW}" height="4" rx="2"/>` +
-              (n > 0 && done > 0
-                ? `<rect class="fill" x="${barX}" y="${y + 35}" width="${(barW * done) / n}" height="4" rx="2"/>`
-                : '')
-            : '') +
-          `<line class="rule" x1="${PAD}" y1="${y + 51.5}" x2="${W - PAD}" y2="${y + 51.5}"/>`,
-      )
-      layer.nodes.forEach((node, i) => {
-        placed.push({
-          node,
-          x: PAD + (i % cols(n)) * (nodeW + GAP),
-          y: y + HEAD_H + Math.floor(i / cols(n)) * (NODE_H + GAP),
-          w: nodeW,
-          h: NODE_H,
-        })
-      })
-      y += HEAD_H + rows * NODE_H + (rows - 1) * GAP + LAYER_GAP
-    }
-
-    return { placed, headings, H: Math.max(y - LAYER_GAP + PAD + 24, 60) }
-  }
-
+  const sameRow = (a: Placed, b: Placed) => Math.abs(a.y - b.y) < 1
   const pairs = (placed: Placed[]) => {
     const byName = new Map(placed.map(p => [p.node.name, p]))
 
@@ -390,10 +387,56 @@ export function architectureSvg(data: Board, columns = 40): string {
     })
   }
 
-  // A link whose curve would pass behind another card goes round by the
+  // Lays the nodes out with `gutter` pixels kept free at the right for links.
+  const build = (gutter: number) => {
+    const avail = W - 2 * PAD - 2 * INNER - gutter
+    const cap = fitPerRow(W, gutter)
+    const placed: Placed[] = []
+    const groups: { layer: number; y: number; h: number }[] = []
+    let y = PAD + HERO_H + 16
+    data.layers.forEach((layer, li) => {
+      const n = layer.nodes.length
+      const rows = Math.max(1, Math.ceil(n / cap))
+      // Rows as even as they can be, each centred.
+      const per = Math.max(1, Math.ceil(n / rows))
+      layer.nodes.forEach((node, i) => {
+        const row = Math.floor(i / per)
+        const inRow = Math.min(per, n - row * per)
+        const rowW = inRow * NODE_W + (inRow - 1) * NODE_GAP
+        placed.push({
+          node,
+          layer: li,
+          x: PAD + INNER + (avail - rowW) / 2 + (i % per) * (NODE_W + NODE_GAP),
+          y: y + TOP_PAD + row * (NODE_H + ROW_GAP),
+          w: NODE_W,
+          h: NODE_H,
+        })
+      })
+      groups.push({ layer: li, y, h: TOP_PAD + rows * NODE_H + (rows - 1) * ROW_GAP + BOTTOM_PAD })
+      y += groups[groups.length - 1].h + GROUP_GAP
+    })
+    // Room under a group whose last row has a link within the row.
+    let shift = 0
+    for (const g of groups) {
+      g.y += shift
+      const mine = placed.filter(p => p.layer === g.layer)
+      for (const p of mine) p.y += shift
+      const lastY = Math.max(...mine.map(p => p.y), -1)
+      const dips = pairs(placed).some(({ a, b }) => a.layer === g.layer && sameRow(a, b) && Math.abs(a.y - lastY) < 1)
+      if (dips) {
+        g.h += DIP + 6
+        shift += DIP + 6
+      }
+    }
+    const end = groups.length ? groups[groups.length - 1].y + groups[groups.length - 1].h : PAD + HERO_H
+
+    return { placed, groups, H: end + PAD + 4 }
+  }
+
+  // A link whose curve would pass behind another node goes round by the
   // channel at the right instead.
   const blocked = (placed: Placed[], a: Placed, b: Placed): boolean => {
-    if (Math.abs(a.y - b.y) < 1) return false
+    if (sameRow(a, b)) return false
     const [p1, c1, c2, p2] = linkCurve(a, b)
 
     return curvePoints(p1, c1, c2, p2).some(pt =>
@@ -401,124 +444,155 @@ export function architectureSvg(data: Board, columns = 40): string {
         card =>
           card !== a &&
           card !== b &&
-          pt.x > card.x + 2 &&
-          pt.x < card.x + card.w - 2 &&
-          pt.y > card.y + 2 &&
-          pt.y < card.y + card.h - 2,
+          pt.x > card.x + 4 &&
+          pt.x < card.x + card.w - 4 &&
+          pt.y > card.y &&
+          pt.y < card.y + card.h,
       ),
     )
   }
 
   const first = build(0)
   const lanes = pairs(first.placed).filter(({ a, b }) => blocked(first.placed, a, b)).length
-  const { placed, headings, H } = lanes > 0 ? build(14 + lanes * 10) : first
+  const { placed, groups, H } = lanes > 0 ? build(INNER + lanes * 10) : first
 
   const links: string[] = []
   const labels: string[] = []
-  const pill = (text: string, cx: number, cy: number) => {
+  const pill = (text: string, cx: number, cy: number, color: string) => {
     const label = fit(text, 16)
-    const lw = units(label) * 6 + 14
+    const lw = units(label) * 6 + 16
 
     return (
-      `<rect class="lbg" x="${cx - lw / 2}" y="${cy - 9}" width="${lw}" height="18" rx="9"/>` +
-      `<text class="ltext" x="${cx}" y="${cy + 4}" text-anchor="middle">${esc(label)}</text>`
+      `<rect class="lbg" x="${cx - lw / 2}" y="${cy - 10}" width="${lw}" height="20" rx="10" stroke="${alpha(color, 0.6)}"/>` +
+      `<text class="ltext" x="${cx}" y="${cy + 4}" text-anchor="middle" style="fill:${color}">${esc(label)}</text>`
     )
   }
   let lane = 0
   for (const { link, a, b } of pairs(placed)) {
-    if (Math.abs(a.y - b.y) < 1) {
-      // Same row: dip below the cards and come back up, past none of them.
-      const ax = a.x + a.w / 2
-      const bx = b.x + b.w / 2
-      const dip = 26
-      links.push(
-        `<path class="link" d="M${ax} ${a.y + a.h} C${ax} ${a.y + a.h + dip * 1.3} ${bx} ${b.y + b.h + dip * 1.3} ${bx} ${b.y + b.h + 3}" marker-end="url(#arrow)"/>`,
-      )
-      if (link.label) labels.push(pill(link.label, (ax + bx) / 2, a.y + a.h + dip))
+    const color = layerColor(a.layer)
+    const line = (d: string) =>
+      `<path class="link" d="${d}" stroke="${color}" marker-end="url(#ar${a.layer % LAYER_COLORS.length})"/>`
+    const ax = a.x + a.w / 2
+    const bx = b.x + b.w / 2
+    if (sameRow(a, b)) {
+      // Same row: dip below the nodes and come back up, past none of them.
+      const y1 = a.y + a.h
+      links.push(line(`M${ax} ${y1} C${ax} ${y1 + DIP * 1.4} ${bx} ${y1 + DIP * 1.4} ${bx} ${y1 + 3}`))
+      if (link.label) labels.push(pill(link.label, (ax + bx) / 2, y1 + DIP + 2, color))
     } else if (blocked(placed, a, b)) {
-      // Round by the right-hand channel, every leg in a gap between cards: out
-      // of the source, along the gap beside it to the channel, along the
-      // channel, along the gap beside the target, and into it.
-      const gx = W - PAD - 6 - lane * 10
+      // Round by the right-hand channel, every leg in a gap between nodes.
+      const gx = W - PAD - INNER / 2 - 4 - lane * 10
       lane += 1
       const down = b.y > a.y
-      const ax = a.x + a.w - 24
-      const bx = b.x + b.w - 24
-      const aEdge = down ? a.y + a.h : a.y
-      const bEdge = down ? b.y - 3 : b.y + b.h + 3
-      const ya = down ? a.y + a.h + 5 : a.y - 5
-      const yb = down ? b.y - 5 : b.y + b.h + 5
+      const ya = down ? a.y + a.h + 10 : a.y - 10
+      const yb = down ? b.y - 10 : b.y + b.h + 10
       links.push(
-        `<path class="link" d="${elbow([
-          { x: ax, y: aEdge },
-          { x: ax, y: ya },
-          { x: gx, y: ya },
-          { x: gx, y: yb },
-          { x: bx, y: yb },
-          { x: bx, y: bEdge },
-        ])}" marker-end="url(#arrow)"/>`,
+        line(
+          elbow([
+            { x: ax, y: down ? a.y + a.h : a.y },
+            { x: ax, y: ya },
+            { x: gx, y: ya },
+            { x: gx, y: yb },
+            { x: bx, y: yb },
+            { x: bx, y: down ? b.y - 2 : b.y + b.h + 3 },
+          ]),
+        ),
       )
-      if (link.label) {
-        // In the empty right end of the source card's tag row, over where the
-        // line leaves it.
-        const label = fit(link.label, 16)
-        const lw = units(label) * 6 + 14
-        labels.push(pill(link.label, a.x + a.w - 10 - lw / 2, a.y + a.h - 19))
-      }
+      if (link.label) labels.push(pill(link.label, (ax + gx) / 2, ya, color))
     } else {
       const [p1, c1, c2, p2] = linkCurve(a, b)
-      links.push(
-        `<path class="link" d="M${p1.x} ${p1.y} C${c1.x} ${c1.y} ${c2.x} ${c2.y} ${p2.x} ${p2.y}" marker-end="url(#arrow)"/>`,
-      )
-      if (link.label) labels.push(pill(link.label, (p1.x + p2.x) / 2, (p1.y + p2.y) / 2))
+      links.push(line(`M${p1.x} ${p1.y} C${c1.x} ${c1.y} ${c2.x} ${c2.y} ${p2.x} ${p2.y}`))
+      if (link.label) labels.push(pill(link.label, (p1.x + p2.x) / 2, (p1.y + p2.y) / 2, color))
     }
   }
 
-  const cards = placed.map(({ node, x, y: ny, w, h }) => {
-    const status = node.status ?? 'todo'
-    const tag = STATUS_TEXT[status]
-    const tagW = units(tag) * 6 + 16
+  // The project's own progress, over every node.
+  const all = data.layers.flatMap(layer => layer.nodes)
+  const allDone = all.filter(node => node.status === 'done').length
+  const part = all.length ? allDone / all.length : 0
+  const wide = W >= 420
+  const textW = W - 2 * PAD - 58 - (wide ? 96 : 0)
+  const hero =
+    ring(PAD + 23, PAD + 23, 20, 4, part, '#7c9cff') +
+    `<text class="title" x="${PAD + 56}" y="${PAD + 20}">${esc(fit(data.name, Math.floor(textW / 9)))}</text>` +
+    (data.summary
+      ? `<text class="muted" font-size="12" x="${PAD + 56}" y="${PAD + 40}">${esc(fit(data.summary, Math.floor(textW / 6.2)))}</text>`
+      : '') +
+    (wide
+      ? `<text class="pct" x="${W - PAD}" y="${PAD + 22}" text-anchor="end">${Math.round(part * 100)}%</text>` +
+        `<text class="muted" font-size="11.5" x="${W - PAD}" y="${PAD + 40}" text-anchor="end">${allDone}/${all.length} 元件完成</text>`
+      : '')
+
+  const frames = groups.map(
+    g =>
+      `<rect class="group" x="${PAD}" y="${g.y}" width="${W - 2 * PAD}" height="${g.h}" rx="14" stroke="${alpha(layerColor(g.layer), 0.45)}"/>`,
+  )
+  const tabs = groups.map(g => {
+    const layer = data.layers[g.layer]
+    const color = layerColor(g.layer)
+    const n = layer.nodes.length
+    const done = layer.nodes.filter(node => node.status === 'done').length
+    const name = fit(layer.name, Math.floor((W - 2 * PAD - 120) / 6.6))
+    const count = `${done}/${n}`
+    const x = PAD + 16
+    const w = 30 + units(name) * 6.6 + 8 + units(count) * 6.2 + 12
 
     return (
-      `<g class="card"><title>${esc(`${node.name}${node.desc ? `：${node.desc}` : ''}（${tag}）`)}</title>` +
-      `<rect class="box" x="${x}" y="${ny}" width="${w}" height="${h}" rx="6"/>` +
-      `<text x="${x + 12}" y="${ny + 30}" font-size="20">${esc(node.icon)}</text>` +
-      `<text class="name" x="${x + 42}" y="${ny + 27}">${esc(fit(node.name, Math.floor((w - 54) / 7.5)))}</text>` +
+      `<rect class="tab" x="${x}" y="${g.y - 12}" width="${w}" height="24" rx="12" stroke="${alpha(color, 0.5)}"/>` +
+      ring(x + 14, g.y, 7, 2.5, n ? done / n : 0, color) +
+      `<text class="tabt" x="${x + 28}" y="${g.y + 4.5}" style="fill:${color}">${esc(name)}<tspan class="cnt" dx="7">${count}</tspan></text>`
+    )
+  })
+
+  const nodes = placed.map(({ node, layer, x, y, w }) => {
+    const status = node.status ?? 'todo'
+    const cx = x + w / 2
+
+    return (
+      `<g class="node"><title>${esc(`${node.name}${node.desc ? `：${node.desc}` : ''}（${STATUS_TEXT[status]}）`)}</title>` +
+      `<rect x="${cx - 30}" y="${y + 4}" width="60" height="60" rx="16" fill="url(#g${layer % LAYER_COLORS.length})" filter="url(#sh)"/>` +
+      `<text x="${cx}" y="${y + 44}" font-size="28" text-anchor="middle">${esc(node.icon)}</text>` +
+      `<circle cx="${cx + 28}" cy="${y + 6}" r="6" fill="${STATUS_COLOR[status]}" class="dot"/>` +
+      `<text class="name" x="${cx}" y="${y + 86}" text-anchor="middle">${esc(fit(node.name, Math.floor(w / 7)))}</text>` +
       (node.desc
-        ? `<text class="desc" x="${x + 12}" y="${ny + 53}">${esc(fit(node.desc, Math.floor((w - 24) / 6.3)))}</text>`
+        ? `<text class="muted" font-size="11.5" x="${cx}" y="${y + 103}" text-anchor="middle">${esc(fit(node.desc, Math.floor(w / 6)))}</text>`
         : '') +
-      `<rect class="tag ${status}" x="${x + 12}" y="${ny + h - 28}" width="${tagW}" height="18" rx="4"/>` +
-      `<text class="tagt ${status}" x="${x + 20}" y="${ny + h - 15}">${tag}</text>` +
+      `<text class="st" x="${cx}" y="${y + 120}" text-anchor="middle" style="fill:${status === 'todo' ? 'var(--muted)' : STATUS_COLOR[status]}">● ${STATUS_TEXT[status]}</text>` +
       `</g>`
     )
   })
+
+  const defs =
+    `<filter id="sh" x="-30%" y="-30%" width="160%" height="170%"><feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#000" flood-opacity=".3"/></filter>` +
+    LAYER_COLORS.map(
+      (c, i) =>
+        `<linearGradient id="g${i}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${c}" stop-opacity=".75"/><stop offset="1" stop-color="${c}" stop-opacity=".3"/></linearGradient>` +
+        `<marker id="ar${i}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1L9 5L0 9z" fill="${c}"/></marker>`,
+    ).join('')
 
   return (
     // Real pixel sizes: with a percentage the surface has no size to show the
     // picture at, and draws it a few dozen pixels wide.
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">` +
     `<style>` +
-    `svg{--bg:#ffffff;--card:#ffffff;--cardh:#f7f7f5;--border:#e9e9e7;--text:#37352f;--muted:#787774;--rule:#ededeb;--track:#e9e9e7;--fill:#4dab9a;--link:#a5a29b;` +
-    `--done-bg:#dbeddb;--done-fg:#1c3829;--doing-bg:#fdecc8;--doing-fg:#402c1b;--todo-bg:#e3e2e0;--todo-fg:#32302c}` +
-    `@media (prefers-color-scheme: dark){svg{--bg:#191919;--card:#252525;--cardh:#2e2e2e;--border:#2f2f2f;--text:#ebebeb;--muted:#9b9b9b;--rule:#2f2f2f;--track:#323232;--fill:#71cc97;--link:#6b6b6b;` +
-    `--done-bg:#233e2f;--done-fg:#71cc97;--doing-bg:#523d19;--doing-fg:#ecb85e;--todo-bg:#373737;--todo-fg:#b4b4b4}}` +
+    `svg{--bg:#ffffff;--text:#2b2d33;--muted:#6b6f78;--track:#e3e5e9}` +
+    `@media (prefers-color-scheme: dark){svg{--bg:#141517;--text:#ececf1;--muted:#8f929b;--track:#2c2e33}}` +
     `text{font-family:ui-sans-serif,-apple-system,"Segoe UI","Microsoft JhengHei",sans-serif;fill:var(--text)}` +
-    `.h{font-size:17px;font-weight:700;paint-order:stroke;stroke:var(--bg);stroke-width:6px}` +
-    `.meta{font-size:11.5px;fill:var(--muted);paint-order:stroke;stroke:var(--bg);stroke-width:6px}` +
-    `.rule{stroke:var(--rule)}.track{fill:var(--track)}.fill{fill:var(--fill)}` +
-    `.box{fill:var(--card);stroke:var(--border)}.card:hover .box{fill:var(--cardh)}` +
-    `.name{font-size:14.5px;font-weight:600}.desc{font-size:12px;fill:var(--muted)}` +
-    `.tag.done{fill:var(--done-bg)}.tag.doing{fill:var(--doing-bg)}.tag.todo{fill:var(--todo-bg)}` +
-    `.tagt{font-size:11px}.tagt.done{fill:var(--done-fg)}.tagt.doing{fill:var(--doing-fg)}.tagt.todo{fill:var(--todo-fg)}` +
-    `.link{fill:none;stroke:var(--link);stroke-width:1.4}` +
-    `.lbg{fill:var(--bg);stroke:var(--border)}.ltext{font-size:10.5px;fill:var(--muted)}` +
-    `#arrow path{fill:var(--link)}` +
+    `.title{font-size:18px;font-weight:700}.pct{font-size:21px;font-weight:700}.muted{fill:var(--muted)}` +
+    `.track{fill:none;stroke:var(--track)}` +
+    `.group{fill:none;stroke-width:1.4;stroke-dasharray:6 5}` +
+    `.tab{fill:var(--bg);stroke-width:1.4}.tabt{font-size:12.5px;font-weight:700}.cnt{font-weight:400;opacity:.75}` +
+    `.name{font-size:13.5px;font-weight:600}.st{font-size:10.5px}.dot{stroke:var(--bg);stroke-width:3}` +
+    `.link{fill:none;stroke-width:1.6;stroke-opacity:.8}` +
+    `.lbg{fill:var(--bg)}.ltext{font-size:11px}` +
     `</style>` +
     `<rect width="${W}" height="${H}" fill="var(--bg)"/>` +
-    `<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker></defs>` +
+    `<defs>${defs}</defs>` +
+    hero +
+    frames.join('') +
     links.join('') +
-    headings.join('') +
-    cards.join('') +
+    tabs.join('') +
+    nodes.join('') +
     labels.join('') +
     `</svg>`
   )

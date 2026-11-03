@@ -1,4 +1,4 @@
-// 專案看板視窗：讀取專案的 .claude/project-board.json（架構、待辦、已完成）
+﻿// 專案看板視窗：讀取專案的 .claude/project-board.json（架構、待辦、已完成）
 // 與 .claude/project-board-live.json（Claude Code 外掛寫入的即時狀況），
 // 在可縮放的大視窗中顯示。以 Windows 內建的 .NET Framework 編譯（C# 5）。
 using System;
@@ -238,23 +238,232 @@ namespace ProjectBoard
         }
     }
 
-    enum ArchStyle { Flow, Notion }
+    // 彩色 emoji：GDI+ 只會畫出單色的 emoji，這裡直接讀 Segoe UI Emoji 字型的
+    // 彩色圖層（COLR／CPAL 表），一層一層以 GDI 畫出再合成，結果快取成圖片。
+    static class ColorEmoji
+    {
+        [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr CreateFontW(int height, int width, int escapement, int orientation, int weight, uint italic, uint underline,
+            uint strikeOut, uint charSet, uint outPrecision, uint clipPrecision, uint quality, uint pitchAndFamily, string face);
+        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+        [DllImport("gdi32.dll")] static extern uint SetTextColor(IntPtr hdc, int color);
+        [DllImport("gdi32.dll")] static extern int SetBkMode(IntPtr hdc, int mode);
+        [DllImport("gdi32.dll")] static extern uint SetTextAlign(IntPtr hdc, uint align);
+        [DllImport("gdi32.dll")]
+        static extern bool ExtTextOutW(IntPtr hdc, int x, int y, uint options, IntPtr rect, ushort[] glyphs, uint count, IntPtr dx);
+
+        // 以這個字級畫出、快取，畫到畫面時再縮放。
+        const int Em = 96;
+        static byte[] font;
+        static bool loaded;
+        static int cmap = -1, colr = -1, cpal = -1;
+        static readonly Dictionary<string, Bitmap> cache = new Dictionary<string, Bitmap>();
+
+        static int U16(int o) { return (font[o] << 8) | font[o + 1]; }
+        static int U32(int o) { return (font[o] << 24) | (font[o + 1] << 16) | (font[o + 2] << 8) | font[o + 3]; }
+
+        static void Load()
+        {
+            loaded = true;
+            try
+            {
+                string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "seguiemj.ttf");
+                if (!File.Exists(path)) return;
+                font = File.ReadAllBytes(path);
+                int tables = U16(4), cmapTable = -1;
+                for (int i = 0; i < tables; i++)
+                {
+                    int rec = 12 + 16 * i;
+                    string tag = Encoding.ASCII.GetString(font, rec, 4);
+                    int off = U32(rec + 8);
+                    if (tag == "cmap") cmapTable = off;
+                    else if (tag == "COLR") colr = off;
+                    else if (tag == "CPAL") cpal = off;
+                }
+                if (cmapTable < 0) return;
+                // Unicode 全字元對照表（平台 3、編碼 10、格式 12）。
+                for (int i = 0; i < U16(cmapTable + 2); i++)
+                {
+                    int rec = cmapTable + 4 + 8 * i;
+                    int sub = cmapTable + U32(rec + 4);
+                    if (U16(rec) == 3 && U16(rec + 2) == 10 && U16(sub) == 12) cmap = sub;
+                }
+            }
+            catch
+            {
+                font = null;
+                cmap = -1;
+            }
+        }
+
+        static int Glyph(int codePoint)
+        {
+            if (cmap < 0) return 0;
+            int lo = 0, hi = U32(cmap + 12) - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2, grp = cmap + 16 + 12 * mid;
+                int start = U32(grp), end = U32(grp + 4);
+                if (codePoint < start) hi = mid - 1;
+                else if (codePoint > end) lo = mid + 1;
+                else return U32(grp + 8) + codePoint - start;
+            }
+            return 0;
+        }
+
+        // 一個字形的各個彩色圖層；沒有彩色資料就只有一層白色。
+        static List<KeyValuePair<int, Color>> Layers(int glyph)
+        {
+            List<KeyValuePair<int, Color>> layers = new List<KeyValuePair<int, Color>>();
+            if (colr >= 0 && cpal >= 0)
+            {
+                int baseRecs = colr + U32(colr + 4), layerRecs = colr + U32(colr + 8);
+                int colors = cpal + U32(cpal + 8), first = U16(cpal + 12);
+                int lo = 0, hi = U16(colr + 2) - 1;
+                while (lo <= hi)
+                {
+                    int mid = (lo + hi) / 2, rec = baseRecs + 6 * mid, id = U16(rec);
+                    if (glyph < id) hi = mid - 1;
+                    else if (glyph > id) lo = mid + 1;
+                    else
+                    {
+                        for (int i = 0; i < U16(rec + 4); i++)
+                        {
+                            int layer = layerRecs + 4 * (U16(rec + 2) + i);
+                            int palette = U16(layer + 2);
+                            Color c = Color.White;
+                            if (palette != 0xFFFF)
+                            {
+                                int cr = colors + 4 * (first + palette);
+                                c = Color.FromArgb(font[cr + 3], font[cr + 2], font[cr + 1], font[cr]);
+                            }
+                            layers.Add(new KeyValuePair<int, Color>(U16(layer), c));
+                        }
+                        return layers;
+                    }
+                }
+            }
+            layers.Add(new KeyValuePair<int, Color>(glyph, Color.White));
+            return layers;
+        }
+
+        static Bitmap Render(string text)
+        {
+            if (!loaded) Load();
+            if (font == null || string.IsNullOrEmpty(text)) return null;
+            int codePoint;
+            try { codePoint = char.ConvertToUtf32(text, 0); }
+            catch { return null; }
+            int glyph = Glyph(codePoint);
+            if (glyph == 0) return null;
+
+            int size = Em * 3 / 2;
+            float[] a = new float[size * size], r = new float[size * size], gr = new float[size * size], b = new float[size * size];
+            using (Bitmap scratch = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            {
+                foreach (KeyValuePair<int, Color> layer in Layers(glyph))
+                {
+                    using (Graphics sg = Graphics.FromImage(scratch))
+                    {
+                        sg.Clear(Color.Black);
+                        IntPtr hdc = sg.GetHdc();
+                        IntPtr f = CreateFontW(-Em, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI Emoji");
+                        IntPtr old = SelectObject(hdc, f);
+                        SetBkMode(hdc, 1);
+                        SetTextColor(hdc, 0xFFFFFF);
+                        SetTextAlign(hdc, 24);
+                        ExtTextOutW(hdc, Em / 4, Em * 9 / 8, 0x10, IntPtr.Zero, new ushort[] { (ushort)layer.Key }, 1, IntPtr.Zero);
+                        SelectObject(hdc, old);
+                        DeleteObject(f);
+                        sg.ReleaseHdc(hdc);
+                    }
+                    System.Drawing.Imaging.BitmapData bits = scratch.LockBits(new Rectangle(0, 0, size, size),
+                        System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+                    byte[] px = new byte[bits.Stride * size];
+                    Marshal.Copy(bits.Scan0, px, 0, px.Length);
+                    scratch.UnlockBits(bits);
+                    Color c = layer.Value;
+                    for (int y = 0; y < size; y++)
+                        for (int x = 0; x < size; x++)
+                        {
+                            float cover = px[y * bits.Stride + x * 3 + 1] / 255f * c.A / 255f;
+                            if (cover <= 0) continue;
+                            int i = y * size + x;
+                            a[i] = cover + a[i] * (1 - cover);
+                            r[i] = c.R * cover + r[i] * (1 - cover);
+                            gr[i] = c.G * cover + gr[i] * (1 - cover);
+                            b[i] = c.B * cover + b[i] * (1 - cover);
+                        }
+                }
+            }
+
+            int minX = size, minY = size, maxX = -1, maxY = -1;
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
+                    if (a[y * size + x] > 0.02f)
+                    {
+                        minX = Math.Min(minX, x); maxX = Math.Max(maxX, x);
+                        minY = Math.Min(minY, y); maxY = Math.Max(maxY, y);
+                    }
+            if (maxX < 0) return null;
+            Bitmap result = new Bitmap(maxX - minX + 1, maxY - minY + 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            for (int y = minY; y <= maxY; y++)
+                for (int x = minX; x <= maxX; x++)
+                {
+                    int i = y * size + x;
+                    if (a[i] <= 0) continue;
+                    result.SetPixel(x - minX, y - minY, Color.FromArgb(
+                        (int)Math.Min(255, a[i] * 255), (int)Math.Min(255, r[i] / a[i]), (int)Math.Min(255, gr[i] / a[i]), (int)Math.Min(255, b[i] / a[i])));
+                }
+            return result;
+        }
+
+        // 把 emoji 畫在 (cx, cy) 為中心、約 size 大小；字型讀不到時退回一般文字。
+        public static void Draw(Graphics g, string text, float cx, float cy, float size)
+        {
+            Bitmap bmp;
+            if (!cache.TryGetValue(text, out bmp))
+            {
+                bmp = Render(text);
+                cache[text] = bmp;
+            }
+            if (bmp == null)
+            {
+                using (Font f = new Font("Segoe UI Emoji", size * 0.8f, GraphicsUnit.Pixel))
+                using (StringFormat sf = new StringFormat())
+                {
+                    sf.Alignment = StringAlignment.Center;
+                    sf.LineAlignment = StringAlignment.Center;
+                    g.DrawString(text, f, Brushes.White, new RectangleF(cx - size, cy - size, size * 2, size * 2), sf);
+                }
+                return;
+            }
+            float k = size / Em;
+            InterpolationMode mode = g.InterpolationMode;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.DrawImage(bmp, cx - bmp.Width * k / 2, cy - bmp.Height * k / 2, bmp.Width * k, bmp.Height * k);
+            g.InterpolationMode = mode;
+        }
+    }
+
+    enum ArchStyle { Flow, Diagram }
 
     // 架構圖：以世界座標排版，滾輪縮放、拖曳平移、雙擊符合視窗。
-    // 兩種畫法：Flow（流程圖：泳道、徽章、直角連線）與 Notion（標題、卡片、標籤）。
+    // 兩種畫法：Diagram（架構圖：虛線分層、彩色圖示方塊、進度環）與 Flow（流程圖：泳道、徽章、直角連線）。
     class ArchCanvas : Control
     {
         static readonly Color[] Palette =
         {
-            Color.FromArgb(88, 166, 255),
-            Color.FromArgb(188, 140, 255),
-            Color.FromArgb(57, 197, 187),
-            Color.FromArgb(255, 166, 87),
-            Color.FromArgb(255, 123, 172),
-            Color.FromArgb(86, 211, 100),
+            Color.FromArgb(79, 142, 247),
+            Color.FromArgb(155, 124, 246),
+            Color.FromArgb(47, 191, 138),
+            Color.FromArgb(240, 148, 58),
+            Color.FromArgb(229, 96, 154),
+            Color.FromArgb(37, 169, 199),
         };
 
-        public ArchStyle Style = ArchStyle.Notion;
+        public ArchStyle Style = ArchStyle.Diagram;
 
         float nodeW, nodeH, gapX, gapY, headH, layerGap, pad, inner;
         BoardData data;
@@ -304,9 +513,9 @@ namespace ProjectBoard
 
         void Params()
         {
-            if (Style == ArchStyle.Notion)
+            if (Style == ArchStyle.Diagram)
             {
-                nodeW = 270; nodeH = 108; gapX = 14; gapY = 14; headH = 70; layerGap = 34; pad = 40; inner = 0;
+                nodeW = 150; nodeH = 142; gapX = 28; gapY = 34; headH = 40; layerGap = 56; pad = 30; inner = 24;
             }
             else
             {
@@ -318,6 +527,11 @@ namespace ProjectBoard
         {
             Params();
             if (data == null) return;
+            if (Style == ArchStyle.Diagram)
+            {
+                LayoutDiagram();
+                return;
+            }
             int perRow = 1;
             foreach (Layer layer in data.Layers) perRow = Math.Max(perRow, Math.Min(3, layer.Nodes.Count));
             float gridW = perRow * nodeW + (perRow - 1) * gapX;
@@ -336,7 +550,7 @@ namespace ProjectBoard
                     int row = i / cols, col = i % cols;
                     int inRow = Math.Min(cols, n - row * cols);
                     float rowW = inRow * nodeW + (inRow - 1) * gapX;
-                    float startX = Style == ArchStyle.Notion ? pad + inner : worldW / 2 - rowW / 2;
+                    float startX = worldW / 2 - rowW / 2;
                     Node node = layer.Nodes[i];
                     node.Layer = li;
                     node.Rect = new RectangleF(startX + col * (nodeW + gapX), y + headH + row * (nodeH + gapY), nodeW, nodeH);
@@ -430,7 +644,7 @@ namespace ProjectBoard
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.Clear(Style == ArchStyle.Notion ? Color.FromArgb(25, 25, 25) : Color.FromArgb(21, 23, 27));
+            g.Clear(Style == ArchStyle.Diagram ? DiagramBg : Color.FromArgb(21, 23, 27));
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
@@ -451,7 +665,7 @@ namespace ProjectBoard
             if (Style == ArchStyle.Flow) DrawDotGrid(g);
             g.TranslateTransform(offset.X, offset.Y);
             g.ScaleTransform(scale, scale);
-            if (Style == ArchStyle.Notion) PaintNotion(g);
+            if (Style == ArchStyle.Diagram) PaintDiagram(g);
             else PaintFlow(g);
         }
 
@@ -490,120 +704,299 @@ namespace ProjectBoard
             return done;
         }
 
-        // ---------- Notion ----------
+        // ---------- 架構圖 ----------
 
-        static void NotionTag(string status, out Color fg, out Color bg)
+        static readonly Color DiagramBg = Color.FromArgb(20, 21, 23);
+        const float HeroH = 84;
+
+        static Color StatusColor(string status)
         {
-            if (status == "done") { fg = Color.FromArgb(113, 204, 151); bg = Color.FromArgb(35, 62, 47); }
-            else if (status == "doing") { fg = Color.FromArgb(236, 184, 94); bg = Color.FromArgb(82, 61, 25); }
-            else { fg = Color.FromArgb(180, 180, 180); bg = Color.FromArgb(55, 55, 55); }
+            if (status == "done") return Color.FromArgb(52, 211, 153);
+            if (status == "doing") return Color.FromArgb(245, 165, 36);
+            return Color.FromArgb(138, 141, 150);
         }
 
-        // Notion 的連線：細的平滑曲線。同一排的元件由卡片下緣往下彎再接回，不穿過中間的卡片。
-        void DrawNotionLinks(Graphics g)
+        // 每層一個虛線框，元件平均分排、每排置中；最下排有同排連線時，框底多留空間給往下彎的線。
+        void LayoutDiagram()
         {
-            using (Pen link = new Pen(Color.FromArgb(105, 105, 105), 1.5f))
-            using (AdjustableArrowCap cap = new AdjustableArrowCap(4, 5))
-            using (Font labelFont = new Font(Theme.Ui, 12, GraphicsUnit.Pixel))
+            int perRow = 1;
+            foreach (Layer layer in data.Layers) perRow = Math.Max(perRow, Math.Min(4, layer.Nodes.Count));
+            worldW = Math.Max(2 * pad + 2 * inner + perRow * nodeW + (perRow - 1) * gapX, 640);
+            float y = pad + HeroH;
+            for (int li = 0; li < data.Layers.Count; li++)
             {
-                link.CustomEndCap = cap;
+                Layer layer = data.Layers[li];
+                int n = layer.Nodes.Count;
+                int rows = Math.Max(1, (n + perRow - 1) / perRow);
+                int per = Math.Max(1, (n + rows - 1) / rows);
+                for (int i = 0; i < n; i++)
+                {
+                    int row = i / per;
+                    int inRow = Math.Min(per, n - row * per);
+                    float rowW = inRow * nodeW + (inRow - 1) * gapX;
+                    Node node = layer.Nodes[i];
+                    node.Layer = li;
+                    node.Rect = new RectangleF(worldW / 2 - rowW / 2 + (i % per) * (nodeW + gapX), y + headH + row * (nodeH + gapY), nodeW, nodeH);
+                }
+                float h = headH + rows * nodeH + (rows - 1) * gapY + 18;
+                float lastRow = y + headH + (rows - 1) * (nodeH + gapY);
+                foreach (Link l in data.Links)
+                {
+                    Node a = Find(l.From), b = Find(l.To);
+                    if (a != null && b != null && a.Layer == li && b.Layer == li
+                        && Math.Abs(a.Rect.Y - lastRow) < 1 && Math.Abs(b.Rect.Y - lastRow) < 1)
+                    {
+                        h += 30;
+                        break;
+                    }
+                }
+                layer.Rect = new RectangleF(pad, y, worldW - 2 * pad, h);
+                y += h + layerGap;
+            }
+            worldH = Math.Max(y - layerGap + pad, 200);
+        }
+
+        static void Ring(Graphics g, float cx, float cy, float r, float w, float part, Color color)
+        {
+            using (Pen track = new Pen(Color.FromArgb(44, 46, 51), w))
+                g.DrawEllipse(track, cx - r, cy - r, 2 * r, 2 * r);
+            if (part <= 0) return;
+            using (Pen arc = new Pen(color, w))
+            {
+                arc.StartCap = LineCap.Round;
+                arc.EndCap = LineCap.Round;
+                if (part >= 1) g.DrawEllipse(arc, cx - r, cy - r, 2 * r, 2 * r);
+                else g.DrawArc(arc, cx - r, cy - r, 2 * r, 2 * r, -90, 360 * part);
+            }
+        }
+
+        // 由來源文字下緣到目標圖示上緣（或反過來往上）的曲線。
+        static void Curve(Node a, Node b, out PointF p1, out PointF c1, out PointF c2, out PointF p2)
+        {
+            bool down = b.Rect.Y > a.Rect.Y;
+            p1 = new PointF(a.Rect.X + a.Rect.Width / 2, down ? a.Rect.Bottom : a.Rect.Top);
+            p2 = new PointF(b.Rect.X + b.Rect.Width / 2, down ? b.Rect.Top - 2 : b.Rect.Bottom + 3);
+            float bend = (p2.Y - p1.Y) / 2;
+            c1 = new PointF(p1.X, p1.Y + bend);
+            c2 = new PointF(p2.X, p2.Y - bend);
+        }
+
+        // 曲線會不會從其他元件後面穿過。
+        bool Blocked(Node a, Node b)
+        {
+            if (Math.Abs(a.Rect.Y - b.Rect.Y) < 1) return false;
+            PointF p1, c1, c2, p2;
+            Curve(a, b, out p1, out c1, out c2, out p2);
+            for (float t = 0.04f; t < 0.97f; t += 0.04f)
+            {
+                float u = 1 - t;
+                float x = u * u * u * p1.X + 3 * u * u * t * c1.X + 3 * u * t * t * c2.X + t * t * t * p2.X;
+                float y = u * u * u * p1.Y + 3 * u * u * t * c1.Y + 3 * u * t * t * c2.Y + t * t * t * p2.Y;
+                foreach (Layer layer in data.Layers)
+                    foreach (Node node in layer.Nodes)
+                        if (node != a && node != b && x > node.Rect.X + 4 && x < node.Rect.Right - 4 && y > node.Rect.Y && y < node.Rect.Bottom)
+                            return true;
+            }
+            return false;
+        }
+
+        // 直線段加圓角的折線。
+        static GraphicsPath Elbow(PointF[] pts, float radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            PointF from = pts[0];
+            for (int i = 1; i < pts.Length - 1; i++)
+            {
+                PointF prev = pts[i - 1], cur = pts[i], next = pts[i + 1];
+                float lenIn = (float)Math.Sqrt((cur.X - prev.X) * (cur.X - prev.X) + (cur.Y - prev.Y) * (cur.Y - prev.Y));
+                float lenOut = (float)Math.Sqrt((next.X - cur.X) * (next.X - cur.X) + (next.Y - cur.Y) * (next.Y - cur.Y));
+                if (lenIn < 0.5f || lenOut < 0.5f) continue;
+                float r = Math.Min(radius, Math.Min(lenIn / 2, lenOut / 2));
+                PointF a = new PointF(cur.X - (cur.X - prev.X) / lenIn * r, cur.Y - (cur.Y - prev.Y) / lenIn * r);
+                PointF b = new PointF(cur.X + (next.X - cur.X) / lenOut * r, cur.Y + (next.Y - cur.Y) / lenOut * r);
+                path.AddLine(from, a);
+                path.AddBezier(a, cur, cur, b);
+                from = b;
+            }
+            path.AddLine(from, pts[pts.Length - 1]);
+            return path;
+        }
+
+        void LabelPill(Graphics g, string text, Font font, Color color, PointF at)
+        {
+            SizeF s = g.MeasureString(text, font);
+            RectangleF r = new RectangleF(at.X - (s.Width + 12) / 2, at.Y - (s.Height + 4) / 2, s.Width + 12, s.Height + 4);
+            using (GraphicsPath p = Theme.Round(r, r.Height / 2))
+            using (SolidBrush bg = new SolidBrush(DiagramBg))
+            using (Pen border = new Pen(Color.FromArgb(150, color), 1.2f))
+            using (SolidBrush fg = new SolidBrush(color))
+            using (StringFormat sf = new StringFormat())
+            {
+                sf.Alignment = StringAlignment.Center;
+                sf.LineAlignment = StringAlignment.Center;
+                g.FillPath(bg, p);
+                g.DrawPath(border, p);
+                g.DrawString(text, font, fg, r, sf);
+            }
+        }
+
+        void PaintDiagram(Graphics g)
+        {
+            int total = 0, allDone = 0;
+            foreach (Layer layer in data.Layers)
+            {
+                total += layer.Nodes.Count;
+                allDone += DoneCount(layer);
+            }
+            float part = total > 0 ? (float)allDone / total : 0;
+
+            using (StringFormat one = new StringFormat(StringFormatFlags.NoWrap))
+            using (StringFormat center = new StringFormat(StringFormatFlags.NoWrap))
+            using (StringFormat right = new StringFormat(StringFormatFlags.NoWrap))
+            using (SolidBrush text = new SolidBrush(Color.FromArgb(236, 236, 241)))
+            using (SolidBrush muted = new SolidBrush(Color.FromArgb(143, 146, 155)))
+            {
+                one.Trimming = StringTrimming.EllipsisCharacter;
+                center.Trimming = StringTrimming.EllipsisCharacter;
+                center.Alignment = StringAlignment.Center;
+                right.Alignment = StringAlignment.Far;
+
+                // 專案整體進度。
+                using (Font title = new Font(Theme.Ui, 22, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (Font summary = new Font(Theme.Ui, 14, GraphicsUnit.Pixel))
+                using (Font pct = new Font(Theme.Ui, 27, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (Font small = new Font(Theme.Ui, 13, GraphicsUnit.Pixel))
+                {
+                    Ring(g, pad + 26, pad + 27, 22, 5, part, Color.FromArgb(124, 156, 255));
+                    float tw = worldW - 2 * pad - 64 - 150;
+                    g.DrawString(data.Name, title, text, new RectangleF(pad + 64, pad + 2, tw, 30), one);
+                    if (data.Summary != "") g.DrawString(data.Summary, summary, muted, new RectangleF(pad + 64, pad + 34, tw, 22), one);
+                    g.DrawString(Math.Round(part * 100) + "%", pct, text, new RectangleF(worldW - pad - 150, pad - 2, 150, 36), right);
+                    g.DrawString(allDone + "/" + total + " 元件完成", small, muted, new RectangleF(worldW - pad - 180, pad + 36, 180, 20), right);
+                }
+
+                // 每層的虛線框。
+                for (int li = 0; li < data.Layers.Count; li++)
+                    using (GraphicsPath p = Theme.Round(data.Layers[li].Rect, 16))
+                    using (Pen dash = new Pen(Color.FromArgb(115, LayerColor(li)), 1.5f))
+                    {
+                        dash.DashPattern = new float[] { 4, 3.3f };
+                        g.DrawPath(dash, p);
+                    }
+
+                // 連線：顏色跟來源那一層；會被擋住的改走右側通道。
+                List<KeyValuePair<PointF, Link>> labelAt = new List<KeyValuePair<PointF, Link>>();
+                int lane = 0;
                 foreach (Link l in data.Links)
                 {
                     Node a = Find(l.From), b = Find(l.To);
                     if (a == null || b == null) continue;
-                    PointF p1, p2, c1, c2, m;
-                    if (Math.Abs(a.Rect.Y - b.Rect.Y) < 1)
+                    using (Pen pen = new Pen(Color.FromArgb(205, LayerColor(a.Layer)), 1.8f))
+                    using (AdjustableArrowCap cap = new AdjustableArrowCap(4.5f, 5.5f))
                     {
-                        float dip = Math.Min(layerGap - 6, 30);
-                        p1 = new PointF(a.Rect.X + a.Rect.Width / 2, a.Rect.Bottom);
-                        p2 = new PointF(b.Rect.X + b.Rect.Width / 2, b.Rect.Bottom + 3);
-                        c1 = new PointF(p1.X, p1.Y + dip * 1.3f);
-                        c2 = new PointF(p2.X, p2.Y + dip * 1.3f);
-                        m = new PointF((p1.X + p2.X) / 2, p1.Y + dip);
-                    }
-                    else
-                    {
-                        bool down = b.Rect.Y > a.Rect.Y;
-                        p1 = new PointF(a.Rect.X + a.Rect.Width / 2, down ? a.Rect.Bottom : a.Rect.Top);
-                        p2 = new PointF(b.Rect.X + b.Rect.Width / 2, down ? b.Rect.Top - 2 : b.Rect.Bottom + 2);
-                        float bend = (p2.Y - p1.Y) * 0.5f;
-                        c1 = new PointF(p1.X, p1.Y + bend);
-                        c2 = new PointF(p2.X, p2.Y - bend);
-                        m = new PointF((p1.X + p2.X) / 2, (p1.Y + p2.Y) / 2);
-                    }
-                    g.DrawBezier(link, p1, c1, c2, p2);
-                    if (l.Label != "")
-                    {
-                        SizeF s = g.MeasureString(l.Label, labelFont);
-                        Pill(g, l.Label, labelFont, Color.FromArgb(170, 170, 170), Color.FromArgb(32, 32, 32), m.X - s.Width / 2 - 6, m.Y - s.Height / 2, 8);
-                    }
-                }
-            }
-        }
-        void PaintNotion(Graphics g)
-        {
-            // 連線先畫，標題文字再蓋上（帶底色），線看起來從標題後方穿過。
-            DrawNotionLinks(g);
-            using (Font title = new Font(Theme.Ui, 20, FontStyle.Bold, GraphicsUnit.Pixel))
-            using (Font meta = new Font(Theme.Ui, 13, GraphicsUnit.Pixel))
-            using (SolidBrush text = new SolidBrush(Color.FromArgb(235, 235, 235)))
-            using (SolidBrush muted = new SolidBrush(Color.FromArgb(155, 155, 155)))
-            using (SolidBrush track = new SolidBrush(Color.FromArgb(50, 50, 50)))
-            using (SolidBrush fill = new SolidBrush(Color.FromArgb(113, 204, 151)))
-            using (Pen rule = new Pen(Color.FromArgb(47, 47, 47), 1))
-            {
-                using (SolidBrush bg = new SolidBrush(Color.FromArgb(25, 25, 25)))
-                foreach (Layer layer in data.Layers)
-                {
-                    RectangleF r = layer.Rect;
-                    int done = DoneCount(layer), n = layer.Nodes.Count;
-                    string line = n + " 個元件 · " + done + "/" + n + " 完成";
-                    SizeF ts = g.MeasureString(layer.Name, title), ms = g.MeasureString(line, meta);
-                    g.FillRectangle(bg, r.X - 6, r.Y - 2, ts.Width + 8, ts.Height + 2);
-                    g.FillRectangle(bg, r.X - 6, r.Y + 30, ms.Width + 8, ms.Height + 2);
-                    g.DrawString(layer.Name, title, text, r.X - 2, r.Y);
-                    g.DrawString(line, meta, muted, r.X, r.Y + 32);
-                    float barX = r.X + 170, barW = Math.Min(180, r.Width - 180);
-                    if (barW > 40)
-                    {
-                        g.FillRectangle(track, barX, r.Y + 40, barW, 4);
-                        if (n > 0) g.FillRectangle(fill, barX, r.Y + 40, barW * done / n, 4);
-                    }
-                    g.DrawLine(rule, r.X, r.Y + headH - 10, r.Right, r.Y + headH - 10);
-                }
-            }
-
-            using (Font icon = new Font("Segoe UI Emoji", 22, GraphicsUnit.Pixel))
-            using (Font name = new Font(Theme.Ui, 16, FontStyle.Bold, GraphicsUnit.Pixel))
-            using (Font desc = new Font(Theme.Ui, 13, GraphicsUnit.Pixel))
-            using (Font tag = new Font(Theme.Ui, 12, GraphicsUnit.Pixel))
-            using (SolidBrush text = new SolidBrush(Color.FromArgb(235, 235, 235)))
-            using (SolidBrush muted = new SolidBrush(Color.FromArgb(155, 155, 155)))
-            using (StringFormat one = new StringFormat(StringFormatFlags.NoWrap))
-            {
-                one.Trimming = StringTrimming.EllipsisCharacter;
-                foreach (Layer layer in data.Layers)
-                {
-                    foreach (Node node in layer.Nodes)
-                    {
-                        RectangleF r = node.Rect;
-                        bool hot = node == hovered;
-                        using (GraphicsPath p = Theme.Round(r, 6))
-                        using (SolidBrush card = new SolidBrush(hot ? Color.FromArgb(46, 46, 46) : Color.FromArgb(37, 37, 37)))
-                        using (Pen border = new Pen(hot ? Color.FromArgb(80, 80, 80) : Color.FromArgb(50, 50, 50), 1))
+                        pen.CustomEndCap = cap;
+                        float ax = a.Rect.X + a.Rect.Width / 2, bx = b.Rect.X + b.Rect.Width / 2;
+                        PointF m;
+                        if (Math.Abs(a.Rect.Y - b.Rect.Y) < 1)
                         {
-                            g.FillPath(card, p);
-                            g.DrawPath(border, p);
+                            float y1 = a.Rect.Bottom, dip = 24;
+                            g.DrawBezier(pen, new PointF(ax, y1), new PointF(ax, y1 + dip * 1.4f), new PointF(bx, y1 + dip * 1.4f), new PointF(bx, y1 + 3));
+                            m = new PointF((ax + bx) / 2, y1 + dip + 2);
                         }
-                        g.DrawString(node.Icon, icon, text, r.X + 12, r.Y + 12);
-                        g.DrawString(node.Name, name, text, new RectangleF(r.X + 48, r.Y + 15, r.Width - 60, 24), one);
-                        if (node.Desc != "")
-                            g.DrawString(node.Desc, desc, muted, new RectangleF(r.X + 14, r.Y + 48, r.Width - 28, 20), one);
-                        Color fg, bg;
-                        NotionTag(node.Status, out fg, out bg);
-                        Pill(g, StatusText(node.Status), tag, fg, bg, r.X + 14, r.Bottom - 30, 8);
+                        else if (Blocked(a, b))
+                        {
+                            float gx = worldW - pad - inner / 2 - 4 - lane * 8;
+                            lane++;
+                            bool down = b.Rect.Y > a.Rect.Y;
+                            float ya = down ? a.Rect.Bottom + 12 : a.Rect.Top - 12;
+                            float yb = down ? b.Rect.Top - 12 : b.Rect.Bottom + 12;
+                            using (GraphicsPath path = Elbow(new PointF[]
+                            {
+                                new PointF(ax, down ? a.Rect.Bottom : a.Rect.Top), new PointF(ax, ya), new PointF(gx, ya),
+                                new PointF(gx, yb), new PointF(bx, yb), new PointF(bx, down ? b.Rect.Top - 2 : b.Rect.Bottom + 3),
+                            }, 10))
+                                g.DrawPath(pen, path);
+                            m = new PointF((ax + gx) / 2, ya);
+                        }
+                        else
+                        {
+                            PointF p1, c1, c2, p2;
+                            Curve(a, b, out p1, out c1, out c2, out p2);
+                            g.DrawBezier(pen, p1, c1, c2, p2);
+                            m = new PointF((p1.X + p2.X) / 2, (p1.Y + p2.Y) / 2);
+                        }
+                        if (l.Label != "") labelAt.Add(new KeyValuePair<PointF, Link>(m, l));
                     }
                 }
+
+                // 框線上的層名標籤，附小進度環。
+                using (Font tabFont = new Font(Theme.Ui, 14, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (Font countFont = new Font(Theme.Ui, 13, GraphicsUnit.Pixel))
+                    for (int li = 0; li < data.Layers.Count; li++)
+                    {
+                        Layer layer = data.Layers[li];
+                        RectangleF r = layer.Rect;
+                        Color lc = LayerColor(li);
+                        int n = layer.Nodes.Count, done = DoneCount(layer);
+                        string count = done + "/" + n;
+                        SizeF ns = g.MeasureString(layer.Name, tabFont), cs = g.MeasureString(count, countFont);
+                        RectangleF tab = new RectangleF(r.X + 20, r.Y - 14, 34 + ns.Width + cs.Width + 6, 28);
+                        using (GraphicsPath p = Theme.Round(tab, 14))
+                        using (SolidBrush bg = new SolidBrush(DiagramBg))
+                        using (Pen border = new Pen(Color.FromArgb(128, lc), 1.5f))
+                        using (SolidBrush name = new SolidBrush(lc))
+                        using (SolidBrush cnt = new SolidBrush(Color.FromArgb(190, lc)))
+                        {
+                            g.FillPath(bg, p);
+                            g.DrawPath(border, p);
+                            Ring(g, tab.X + 16, r.Y, 8, 3, n > 0 ? (float)done / n : 0, lc);
+                            g.DrawString(layer.Name, tabFont, name, tab.X + 29, r.Y - ns.Height / 2);
+                            g.DrawString(count, countFont, cnt, tab.X + 29 + ns.Width, r.Y - cs.Height / 2 + 1);
+                        }
+                    }
+
+                // 元件：彩色漸層圖示方塊、右上角狀態點、名稱、說明、狀態文字。
+                using (Font name = new Font(Theme.Ui, 15, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (Font desc = new Font(Theme.Ui, 12.5f, GraphicsUnit.Pixel))
+                using (Font state = new Font(Theme.Ui, 12, GraphicsUnit.Pixel))
+                using (SolidBrush bgBrush = new SolidBrush(DiagramBg))
+                using (SolidBrush shadow = new SolidBrush(Color.FromArgb(80, 0, 0, 0)))
+                    foreach (Layer layer in data.Layers)
+                        foreach (Node node in layer.Nodes)
+                        {
+                            RectangleF r = node.Rect;
+                            Color lc = LayerColor(node.Layer);
+                            bool hot = node == hovered;
+                            float cx = r.X + r.Width / 2;
+                            RectangleF tile = new RectangleF(cx - 34, r.Y + 4, 68, 68);
+                            using (GraphicsPath sp = Theme.Round(new RectangleF(tile.X + 1, tile.Y + 5, tile.Width - 2, tile.Height), 18))
+                                g.FillPath(shadow, sp);
+                            using (GraphicsPath tp = Theme.Round(tile, 18))
+                            using (LinearGradientBrush fill = new LinearGradientBrush(tile, Color.FromArgb(hot ? 225 : 195, lc), Color.FromArgb(hot ? 120 : 80, lc), 45f))
+                            using (Pen edge = new Pen(Color.FromArgb(hot ? 110 : 30, 255, 255, 255), 1))
+                            {
+                                g.FillPath(fill, tp);
+                                g.DrawPath(edge, tp);
+                            }
+                            ColorEmoji.Draw(g, node.Icon, cx, tile.Y + tile.Height / 2, 36);
+
+                            Color sc = StatusColor(node.Status);
+                            g.FillEllipse(bgBrush, cx + 33 - 10, r.Y + 6 - 10, 20, 20);
+                            using (SolidBrush dot = new SolidBrush(sc))
+                                g.FillEllipse(dot, cx + 33 - 7, r.Y + 6 - 7, 14, 14);
+
+                            g.DrawString(node.Name, name, text, new RectangleF(r.X - 8, r.Y + 80, r.Width + 16, 22), center);
+                            if (node.Desc != "") g.DrawString(node.Desc, desc, muted, new RectangleF(r.X - 8, r.Y + 102, r.Width + 16, 20), center);
+                            using (SolidBrush st = new SolidBrush(node.Status == "done" || node.Status == "doing" ? sc : muted.Color))
+                                g.DrawString("● " + StatusText(node.Status), state, st, new RectangleF(r.X - 8, r.Y + 121, r.Width + 16, 20), center);
+                        }
+
+                using (Font labelFont = new Font(Theme.Ui, 12, GraphicsUnit.Pixel))
+                    foreach (KeyValuePair<PointF, Link> item in labelAt)
+                    {
+                        Node a = Find(item.Value.From);
+                        LabelPill(g, item.Value.Label, labelFont, LayerColor(a.Layer), item.Key);
+                    }
             }
         }
 
@@ -903,7 +1296,7 @@ namespace ProjectBoard
                     y = done.Count == 0 ? Para(g, draw, "尚無完成項目", small, Theme.Muted, x, y, w) : Chips(g, draw, done, body, x, y, w);
                 y += 18;
 
-                y = Para(g, draw, "架構圖：滾輪縮放、拖曳移動、雙擊符合視窗。\n上方「樣式」按鈕可切換流程圖／Notion。", small, Theme.Muted, x, y + 6, w);
+                y = Para(g, draw, "架構圖：滾輪縮放、拖曳移動、雙擊符合視窗。\n上方「樣式」按鈕可切換架構圖／流程圖。", small, Theme.Muted, x, y + 6, w);
             }
             return y;
         }
@@ -1009,7 +1402,7 @@ namespace ProjectBoard
             Button styleButton = MakeButton(StyleLabel(), null);
             styleButton.Click += delegate
             {
-                canvas.SetStyle(canvas.Style == ArchStyle.Flow ? ArchStyle.Notion : ArchStyle.Flow);
+                canvas.SetStyle(canvas.Style == ArchStyle.Flow ? ArchStyle.Diagram : ArchStyle.Flow);
                 Program.SaveStyle(canvas.Style);
                 styleButton.Text = StyleLabel();
             };
@@ -1069,7 +1462,7 @@ namespace ProjectBoard
 
         string StyleLabel()
         {
-            return canvas.Style == ArchStyle.Flow ? "樣式：流程圖 ⇄" : "樣式：Notion ⇄";
+            return canvas.Style == ArchStyle.Flow ? "樣式：流程圖 ⇄" : "樣式：架構圖 ⇄";
         }
 
         Button MakeButton(string text, EventHandler onClick)
@@ -1174,7 +1567,7 @@ namespace ProjectBoard
             get { return AppFile("last-project.txt"); }
         }
 
-        // 命令列 --style notion|flow 優先，其次是上次選的樣式。
+        // 命令列 --style diagram|flow 優先，其次是上次選的樣式（舊的 notion 也當成架構圖）。
         static string styleArg;
 
         public static ArchStyle SavedStyle()
@@ -1185,12 +1578,12 @@ namespace ProjectBoard
                 try { if (File.Exists(AppFile("style.txt"))) value = File.ReadAllText(AppFile("style.txt")).Trim(); }
                 catch { }
             }
-            return value == "flow" ? ArchStyle.Flow : ArchStyle.Notion;
+            return value == "flow" ? ArchStyle.Flow : ArchStyle.Diagram;
         }
 
         public static void SaveStyle(ArchStyle style)
         {
-            try { File.WriteAllText(AppFile("style.txt"), style == ArchStyle.Notion ? "notion" : "flow"); }
+            try { File.WriteAllText(AppFile("style.txt"), style == ArchStyle.Diagram ? "diagram" : "flow"); }
             catch { }
         }
 

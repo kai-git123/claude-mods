@@ -153,9 +153,16 @@ test('the architecture SVG names every node', () => {
 
 test('the drawing follows the pane width', () => {
   expect(nodesPerRow(40)).toBe(1)
-  expect(nodesPerRow(70)).toBe(2)
-  expect(nodesPerRow(120)).toBe(3)
+  expect(nodesPerRow(70)).toBe(3)
+  expect(nodesPerRow(120)).toBe(6)
   expect(architectureSvg(parseBoard(BOARD), 120)).toContain('viewBox="0 0 960 ')
+})
+
+test('the drawing shows the progress of the project and of each layer', () => {
+  const svg = architectureSvg(parseBoard(BOARD), 120)
+  expect(svg).toContain('0/2 元件完成')
+  expect(svg).toContain('0/1</tspan>')
+  expect(svg).toContain('stroke-dasharray:6 5')
 })
 
 test('a folded section hides its chips, and the zoom button opens the large pane', async ($, on) => {
