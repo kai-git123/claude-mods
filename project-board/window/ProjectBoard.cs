@@ -447,10 +447,11 @@ namespace ProjectBoard
         }
     }
 
-    enum ArchStyle { Flow, Diagram }
+    enum ArchStyle { Flow, Diagram, Iso }
 
     // 架構圖：以世界座標排版，滾輪縮放、拖曳平移、雙擊符合視窗。
-    // 兩種畫法：Diagram（架構圖：虛線分層、彩色圖示方塊、進度環）與 Flow（流程圖：泳道、徽章、直角連線）。
+    // 三種畫法：Diagram（架構圖：虛線分層、彩色圖示方塊、進度環）、Flow（流程圖：泳道、徽章、直角連線）
+    // 與 Iso（立體：等角樓層平台，元件是立在平台上的方塊）。
     class ArchCanvas : Control
     {
         static readonly Color[] Palette =
@@ -530,6 +531,11 @@ namespace ProjectBoard
             if (Style == ArchStyle.Diagram)
             {
                 LayoutDiagram();
+                return;
+            }
+            if (Style == ArchStyle.Iso)
+            {
+                LayoutIso();
                 return;
             }
             int perRow = 1;
@@ -644,7 +650,7 @@ namespace ProjectBoard
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.Clear(Style == ArchStyle.Diagram ? DiagramBg : Color.FromArgb(21, 23, 27));
+            g.Clear(Style == ArchStyle.Flow ? Color.FromArgb(21, 23, 27) : DiagramBg);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
@@ -666,6 +672,7 @@ namespace ProjectBoard
             g.TranslateTransform(offset.X, offset.Y);
             g.ScaleTransform(scale, scale);
             if (Style == ArchStyle.Diagram) PaintDiagram(g);
+            else if (Style == ArchStyle.Iso) PaintIso(g);
             else PaintFlow(g);
         }
 
@@ -840,6 +847,24 @@ namespace ProjectBoard
             }
         }
 
+        // 專案整體進度：左邊進度環、名稱與簡介，右邊百分比與完成數。
+        void PaintHero(Graphics g, int allDone, int total, Brush text, Brush muted, StringFormat one, StringFormat right)
+        {
+            float part = total > 0 ? (float)allDone / total : 0;
+            using (Font title = new Font(Theme.Ui, 22, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font summary = new Font(Theme.Ui, 14, GraphicsUnit.Pixel))
+            using (Font pct = new Font(Theme.Ui, 27, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font small = new Font(Theme.Ui, 13, GraphicsUnit.Pixel))
+            {
+                Ring(g, pad + 26, pad + 27, 22, 5, part, Color.FromArgb(124, 156, 255));
+                float tw = worldW - 2 * pad - 64 - 150;
+                g.DrawString(data.Name, title, text, new RectangleF(pad + 64, pad + 2, tw, 30), one);
+                if (data.Summary != "") g.DrawString(data.Summary, summary, muted, new RectangleF(pad + 64, pad + 34, tw, 22), one);
+                g.DrawString(Math.Round(part * 100) + "%", pct, text, new RectangleF(worldW - pad - 150, pad - 2, 150, 36), right);
+                g.DrawString(allDone + "/" + total + " 元件完成", small, muted, new RectangleF(worldW - pad - 180, pad + 36, 180, 20), right);
+            }
+        }
+
         void PaintDiagram(Graphics g)
         {
             int total = 0, allDone = 0;
@@ -861,19 +886,7 @@ namespace ProjectBoard
                 center.Alignment = StringAlignment.Center;
                 right.Alignment = StringAlignment.Far;
 
-                // 專案整體進度。
-                using (Font title = new Font(Theme.Ui, 22, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (Font summary = new Font(Theme.Ui, 14, GraphicsUnit.Pixel))
-                using (Font pct = new Font(Theme.Ui, 27, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (Font small = new Font(Theme.Ui, 13, GraphicsUnit.Pixel))
-                {
-                    Ring(g, pad + 26, pad + 27, 22, 5, part, Color.FromArgb(124, 156, 255));
-                    float tw = worldW - 2 * pad - 64 - 150;
-                    g.DrawString(data.Name, title, text, new RectangleF(pad + 64, pad + 2, tw, 30), one);
-                    if (data.Summary != "") g.DrawString(data.Summary, summary, muted, new RectangleF(pad + 64, pad + 34, tw, 22), one);
-                    g.DrawString(Math.Round(part * 100) + "%", pct, text, new RectangleF(worldW - pad - 150, pad - 2, 150, 36), right);
-                    g.DrawString(allDone + "/" + total + " 元件完成", small, muted, new RectangleF(worldW - pad - 180, pad + 36, 180, 20), right);
-                }
+                PaintHero(g, allDone, total, text, muted, one, right);
 
                 // 每層的虛線框。
                 for (int li = 0; li < data.Layers.Count; li++)
@@ -997,6 +1010,281 @@ namespace ProjectBoard
                         Node a = Find(item.Value.From);
                         LabelPill(g, item.Value.Label, labelFont, LayerColor(a.Layer), item.Key);
                     }
+            }
+        }
+
+        // ---------- 立體 ----------
+
+        // 等角投影：x 沿平台往右下、y 往左下、z 往上。每層一塊平台，由上往下疊成樓層。
+        const float IsoS = 62, IsoH = 44, IsoGap = 66, IsoPadX = 34, IsoBack = 22, IsoFront = 74, IsoT = 16, IsoFloor = 190;
+        const float C30 = 0.866f, S30 = 0.5f;
+        float isoL, isoD, isoOX, isoOY;
+        readonly Dictionary<Node, float> isoX = new Dictionary<Node, float>();
+
+        PointF P(float x, float y, float z)
+        {
+            return new PointF(isoOX + (x - y) * C30, isoOY + (x + y) * S30 - z);
+        }
+
+        float FloorZ(int li)
+        {
+            return (data.Layers.Count - 1 - li) * IsoFloor;
+        }
+
+        static Color Shade(Color c, float f, int alpha)
+        {
+            Func<int, int> m = v => (int)Math.Round(f < 0 ? v * (1 + f) : v + (255 - v) * f);
+            return Color.FromArgb(alpha, m(c.R), m(c.G), m(c.B));
+        }
+
+        static void Fill(Graphics g, Color c, params PointF[] pts)
+        {
+            using (SolidBrush b = new SolidBrush(c)) g.FillPolygon(b, pts);
+        }
+
+        // 所有樓層一樣長（最多元件那層決定），元件在平台上排成一列、置中。
+        void LayoutIso()
+        {
+            int maxN = 1;
+            float tag = 0;
+            foreach (Layer layer in data.Layers)
+            {
+                maxN = Math.Max(maxN, layer.Nodes.Count);
+                tag = Math.Max(tag, 52 + 15 * layer.Name.Length);
+            }
+            isoL = IsoPadX * 2 + maxN * IsoS + (maxN - 1) * IsoGap;
+            isoD = IsoBack + IsoS + IsoFront;
+            isoOX = pad + tag + 16 + isoD * C30;
+            isoOY = pad + HeroH + 40 + FloorZ(0) + IsoT + IsoH;
+            worldW = Math.Max(isoOX + isoL * C30 + pad + 30, 640);
+            worldH = isoOY + (isoL + isoD) * S30 + 70;
+            isoX.Clear();
+            for (int li = 0; li < data.Layers.Count; li++)
+            {
+                Layer layer = data.Layers[li];
+                int n = layer.Nodes.Count;
+                float x0 = (isoL - (n * IsoS + (n - 1) * IsoGap)) / 2, z = FloorZ(li) + IsoT;
+                for (int i = 0; i < n; i++)
+                {
+                    Node node = layer.Nodes[i];
+                    float x = x0 + i * (IsoS + IsoGap);
+                    node.Layer = li;
+                    isoX[node] = x;
+                    PointF l = P(x, IsoBack + IsoS, z), r = P(x + IsoS, IsoBack, z), t = P(x, IsoBack, z + IsoH), b = P(x + IsoS, IsoBack + IsoS, z);
+                    node.Rect = RectangleF.FromLTRB(l.X, t.Y, r.X, b.Y + 42);
+                }
+            }
+        }
+
+        // 方塊頂面中央上方（連線進出點）。
+        PointF IsoTop(Node node)
+        {
+            PointF p = P(isoX[node] + IsoS / 2, IsoBack + IsoS / 2, FloorZ(node.Layer) + IsoT + IsoH);
+            return new PointF(p.X, p.Y - 24);
+        }
+
+        // 方塊前方名稱與說明的下面。
+        PointF IsoUnder(Node node)
+        {
+            PointF p = P(isoX[node] + IsoS, IsoBack + IsoS, FloorZ(node.Layer) + IsoT);
+            return new PointF(p.X, p.Y + 44);
+        }
+
+        void PaintIso(Graphics g)
+        {
+            int total = 0, allDone = 0;
+            foreach (Layer layer in data.Layers)
+            {
+                total += layer.Nodes.Count;
+                allDone += DoneCount(layer);
+            }
+            float L = isoL, D = isoD, T = IsoT, S = IsoS, B = IsoBack;
+
+            using (GraphicsPath glow = new GraphicsPath())
+            {
+                glow.AddEllipse(-worldW * 0.2f, -worldH * 0.05f, worldW * 1.4f, worldH * 0.95f);
+                using (PathGradientBrush pg = new PathGradientBrush(glow))
+                {
+                    pg.CenterColor = Color.FromArgb(31, 33, 39);
+                    pg.SurroundColors = new Color[] { Color.FromArgb(0, DiagramBg) };
+                    g.FillPath(pg, glow);
+                }
+            }
+
+            using (StringFormat one = new StringFormat(StringFormatFlags.NoWrap))
+            using (StringFormat center = new StringFormat(StringFormatFlags.NoWrap))
+            using (StringFormat right = new StringFormat(StringFormatFlags.NoWrap))
+            using (SolidBrush text = new SolidBrush(Color.FromArgb(241, 242, 244)))
+            using (SolidBrush muted = new SolidBrush(Color.FromArgb(154, 156, 163)))
+            using (Font sideFont = new Font(Theme.Ui, 12, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                one.Trimming = StringTrimming.EllipsisCharacter;
+                center.Trimming = StringTrimming.EllipsisCharacter;
+                center.Alignment = StringAlignment.Center;
+                right.Alignment = StringAlignment.Far;
+
+                // 樓層：由最下層畫起，上層蓋住下層的後方。
+                for (int li = data.Layers.Count - 1; li >= 0; li--)
+                {
+                    Layer layer = data.Layers[li];
+                    Color lc = LayerColor(li);
+                    float z = FloorZ(li);
+                    Fill(g, Color.FromArgb(40, 0, 0, 0), P(-8, -8, z - 16), P(L + 14, -8, z - 16), P(L + 14, D + 14, z - 16), P(-8, D + 14, z - 16));
+                    Fill(g, Color.FromArgb(60, 0, 0, 0), P(0, 0, z - 8), P(L + 6, 0, z - 8), P(L + 6, D + 6, z - 8), P(0, D + 6, z - 8));
+                    Fill(g, Shade(lc, -0.45f, 255), P(0, D, z), P(L, D, z), P(L, D, z + T), P(0, D, z + T));
+                    Fill(g, Shade(lc, -0.62f, 255), P(L, 0, z), P(L, D, z), P(L, D, z + T), P(L, 0, z + T));
+                    PointF[] top = { P(0, 0, z + T), P(L, 0, z + T), P(L, D, z + T), P(0, D, z + T) };
+                    using (LinearGradientBrush tb = new LinearGradientBrush(top[0], top[2], Shade(lc, -0.55f, 255), Shade(lc, -0.7f, 255)))
+                        g.FillPolygon(tb, top);
+                    using (Pen grid = new Pen(Color.FromArgb(22, lc), 1))
+                        for (float gx = 40; gx < L; gx += 40) g.DrawLine(grid, P(gx, 0, z + T), P(gx, D, z + T));
+                    using (Pen edge = new Pen(Shade(lc, -0.2f, 255), 1.2f))
+                        g.DrawPolygon(edge, top);
+
+                    // 平台側面斜貼層名與完成數。
+                    GraphicsState saved = g.Save();
+                    PointF lp = P(14, D, z + T - 1);
+                    using (Matrix skew = new Matrix(C30, S30, 0, 1, lp.X, lp.Y))
+                        g.MultiplyTransform(skew);
+                    using (SolidBrush white = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
+                        g.DrawString(layer.Name + "　" + DoneCount(layer) + "/" + layer.Nodes.Count, sideFont, white, 0, 0);
+                    g.Restore(saved);
+
+                    // 元件方塊：未開始的畫成半透明虛線，底部一圈狀態色帶。
+                    foreach (Node node in layer.Nodes)
+                    {
+                        float x = isoX[node], zb = z + T, zt = zb + IsoH;
+                        bool ghost = node.Status != "done" && node.Status != "doing";
+                        int a = ghost ? 110 : 255;
+                        float lift = node == hovered ? 0.42f : 0.25f;
+                        Color sc = StatusColor(node.Status);
+                        Fill(g, Color.FromArgb(70, 0, 0, 0), P(x + 4, B + 6, zb), P(x + S + 12, B + 6, zb), P(x + S + 12, B + S + 12, zb), P(x + 4, B + S + 12, zb));
+                        PointF[] front = { P(x, B + S, zb), P(x + S, B + S, zb), P(x + S, B + S, zt), P(x, B + S, zt) };
+                        PointF[] side = { P(x + S, B, zb), P(x + S, B + S, zb), P(x + S, B + S, zt), P(x + S, B, zt) };
+                        PointF[] cap = { P(x, B, zt), P(x + S, B, zt), P(x + S, B + S, zt), P(x, B + S, zt) };
+                        Fill(g, Shade(lc, -0.15f, a), front);
+                        Fill(g, Shade(lc, -0.38f, a), side);
+                        Fill(g, Shade(lc, lift, a), cap);
+                        using (Pen p1 = new Pen(Shade(lc, 0.2f, a), 1))
+                        using (Pen p2 = new Pen(Shade(lc, 0.5f, a), 1))
+                        {
+                            if (ghost) p1.DashPattern = p2.DashPattern = new float[] { 4, 3 };
+                            g.DrawPolygon(p1, front);
+                            g.DrawPolygon(p1, side);
+                            g.DrawPolygon(p2, cap);
+                        }
+                        Fill(g, Color.FromArgb(ghost ? 150 : 255, sc), P(x, B + S, zb), P(x + S, B + S, zb), P(x + S, B + S, zb + 5), P(x, B + S, zb + 5));
+                        Fill(g, Shade(sc, -0.3f, ghost ? 150 : 255), P(x + S, B, zb), P(x + S, B + S, zb), P(x + S, B + S, zb + 5), P(x + S, B, zb + 5));
+                    }
+                }
+
+                // 連線：顏色跟來源那一層；往下由名稱下方出發、往上由方塊頂端出發，同層的在平台前緣往下彎。
+                List<KeyValuePair<PointF, Link>> labelAt = new List<KeyValuePair<PointF, Link>>();
+                foreach (Link l in data.Links)
+                {
+                    Node a = Find(l.From), b = Find(l.To);
+                    if (a == null || b == null || !isoX.ContainsKey(a) || !isoX.ContainsKey(b)) continue;
+                    PointF p1, p2, c1, c2;
+                    if (a.Layer == b.Layer)
+                    {
+                        p1 = IsoUnder(a);
+                        p2 = IsoUnder(b);
+                        float low = Math.Max(p1.Y, p2.Y) + 44;
+                        c1 = new PointF(p1.X, low);
+                        c2 = new PointF(p2.X, low);
+                    }
+                    else if (a.Layer < b.Layer)
+                    {
+                        p1 = IsoUnder(a);
+                        p2 = IsoTop(b);
+                        float bend = Math.Max(50, (p2.Y - p1.Y) * 0.45f);
+                        c1 = new PointF(p1.X, p1.Y + bend);
+                        c2 = new PointF(p2.X, p2.Y - bend);
+                    }
+                    else
+                    {
+                        p1 = IsoTop(a);
+                        p2 = IsoUnder(b);
+                        float bend = Math.Max(50, (p1.Y - p2.Y) * 0.45f);
+                        c1 = new PointF(p1.X, p1.Y - bend);
+                        c2 = new PointF(p2.X, p2.Y + bend);
+                    }
+                    Color lc = LayerColor(a.Layer);
+                    using (Pen halo = new Pen(Color.FromArgb(46, lc), 6))
+                        g.DrawBezier(halo, p1, c1, c2, p2);
+                    using (Pen pen = new Pen(Color.FromArgb(235, lc), 2))
+                    using (AdjustableArrowCap arrow = new AdjustableArrowCap(4.5f, 5.5f))
+                    {
+                        pen.DashPattern = new float[] { 3.5f, 2.5f };
+                        pen.CustomEndCap = arrow;
+                        g.DrawBezier(pen, p1, c1, c2, p2);
+                    }
+                    if (l.Label != "")
+                        labelAt.Add(new KeyValuePair<PointF, Link>(new PointF((p1.X + 3 * c1.X + 3 * c2.X + p2.X) / 8, (p1.Y + 3 * c1.Y + 3 * c2.Y + p2.Y) / 8), l));
+                }
+
+                // 圖示、狀態燈、名稱與說明。
+                using (Font name = new Font(Theme.Ui, 14, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (Font desc = new Font(Theme.Ui, 11.5f, GraphicsUnit.Pixel))
+                using (SolidBrush bgBrush = new SolidBrush(DiagramBg))
+                    foreach (Layer layer in data.Layers)
+                        foreach (Node node in layer.Nodes)
+                        {
+                            float x = isoX[node], zb = FloorZ(node.Layer) + T, zt = zb + IsoH;
+                            PointF c = P(x + S / 2, B + S / 2, zt);
+                            ColorEmoji.Draw(g, node.Icon, c.X, c.Y - 4, 30);
+                            Color sc = StatusColor(node.Status);
+                            PointF d = P(x + S - 8, B + 8, zt);
+                            if (node.Status == "doing")
+                                using (SolidBrush haloBrush = new SolidBrush(Color.FromArgb(80, sc)))
+                                    g.FillEllipse(haloBrush, d.X - 9, d.Y - 9, 18, 18);
+                            g.FillEllipse(bgBrush, d.X - 6.5f, d.Y - 6.5f, 13, 13);
+                            using (SolidBrush dot = new SolidBrush(sc))
+                                g.FillEllipse(dot, d.X - 4.5f, d.Y - 4.5f, 9, 9);
+                            PointF f = P(x + S, B + S, zb);
+                            g.DrawString(node.Name, name, text, new RectangleF(f.X - 62, f.Y + 8, 124, 20), center);
+                            if (node.Desc != "") g.DrawString(node.Desc, desc, muted, new RectangleF(f.X - 60, f.Y + 26, 120, 18), center);
+                        }
+
+                // 每層左側的標籤，附該層進度環。
+                using (Font tagFont = new Font(Theme.Ui, 14, FontStyle.Bold, GraphicsUnit.Pixel))
+                    for (int li = 0; li < data.Layers.Count; li++)
+                    {
+                        Layer layer = data.Layers[li];
+                        Color lc = LayerColor(li);
+                        PointF at = P(0, D, FloorZ(li) + T);
+                        SizeF ns = g.MeasureString(layer.Name, tagFont);
+                        RectangleF tag = new RectangleF(at.X - 14 - (ns.Width + 40), at.Y - 15, ns.Width + 40, 30);
+                        using (GraphicsPath p = Theme.Round(tag, 15))
+                        using (SolidBrush bg = new SolidBrush(Color.FromArgb(29, 31, 35)))
+                        using (Pen border = new Pen(lc, 1.5f))
+                        {
+                            g.FillPath(bg, p);
+                            g.DrawPath(border, p);
+                        }
+                        int n = layer.Nodes.Count;
+                        Ring(g, tag.X + 17, at.Y, 8, 3.5f, n > 0 ? (float)DoneCount(layer) / n : 0, lc);
+                        g.DrawString(layer.Name, tagFont, text, tag.X + 31, at.Y - ns.Height / 2);
+                    }
+
+                using (Font labelFont = new Font(Theme.Ui, 12, GraphicsUnit.Pixel))
+                    foreach (KeyValuePair<PointF, Link> item in labelAt)
+                        LabelPill(g, item.Value.Label, labelFont, LayerColor(Find(item.Value.From).Layer), item.Key);
+
+                PaintHero(g, allDone, total, text, muted, one, right);
+
+                // 圖例。
+                using (Font legend = new Font(Theme.Ui, 12.5f, GraphicsUnit.Pixel))
+                {
+                    string[] keys = { "done", "doing", "todo" };
+                    for (int i = 0; i < keys.Length; i++)
+                    {
+                        float lx = worldW - pad - 240 + i * 82, ly = worldH - 36;
+                        using (SolidBrush dot = new SolidBrush(StatusColor(keys[i])))
+                            g.FillEllipse(dot, lx - 5, ly - 5, 10, 10);
+                        g.DrawString(StatusText(keys[i]), legend, muted, lx + 9, ly - 9);
+                    }
+                }
             }
         }
 
@@ -1296,7 +1584,7 @@ namespace ProjectBoard
                     y = done.Count == 0 ? Para(g, draw, "尚無完成項目", small, Theme.Muted, x, y, w) : Chips(g, draw, done, body, x, y, w);
                 y += 18;
 
-                y = Para(g, draw, "架構圖：滾輪縮放、拖曳移動、雙擊符合視窗。\n上方「樣式」按鈕可切換架構圖／流程圖。", small, Theme.Muted, x, y + 6, w);
+                y = Para(g, draw, "架構圖：滾輪縮放、拖曳移動、雙擊符合視窗。\n上方「樣式」按鈕可切換架構圖／流程圖／立體。", small, Theme.Muted, x, y + 6, w);
             }
             return y;
         }
@@ -1402,7 +1690,7 @@ namespace ProjectBoard
             Button styleButton = MakeButton(StyleLabel(), null);
             styleButton.Click += delegate
             {
-                canvas.SetStyle(canvas.Style == ArchStyle.Flow ? ArchStyle.Diagram : ArchStyle.Flow);
+                canvas.SetStyle(canvas.Style == ArchStyle.Diagram ? ArchStyle.Flow : canvas.Style == ArchStyle.Flow ? ArchStyle.Iso : ArchStyle.Diagram);
                 Program.SaveStyle(canvas.Style);
                 styleButton.Text = StyleLabel();
             };
@@ -1462,7 +1750,9 @@ namespace ProjectBoard
 
         string StyleLabel()
         {
-            return canvas.Style == ArchStyle.Flow ? "樣式：流程圖 ⇄" : "樣式：架構圖 ⇄";
+            if (canvas.Style == ArchStyle.Flow) return "樣式：流程圖 ⇄";
+            if (canvas.Style == ArchStyle.Iso) return "樣式：立體 ⇄";
+            return "樣式：架構圖 ⇄";
         }
 
         Button MakeButton(string text, EventHandler onClick)
@@ -1567,7 +1857,7 @@ namespace ProjectBoard
             get { return AppFile("last-project.txt"); }
         }
 
-        // 命令列 --style diagram|flow 優先，其次是上次選的樣式（舊的 notion 也當成架構圖）。
+        // 命令列 --style diagram|flow|iso 優先，其次是上次選的樣式（舊的 notion 也當成架構圖）。
         static string styleArg;
 
         public static ArchStyle SavedStyle()
@@ -1578,12 +1868,14 @@ namespace ProjectBoard
                 try { if (File.Exists(AppFile("style.txt"))) value = File.ReadAllText(AppFile("style.txt")).Trim(); }
                 catch { }
             }
-            return value == "flow" ? ArchStyle.Flow : ArchStyle.Diagram;
+            if (value == "flow") return ArchStyle.Flow;
+            if (value == "iso") return ArchStyle.Iso;
+            return ArchStyle.Diagram;
         }
 
         public static void SaveStyle(ArchStyle style)
         {
-            try { File.WriteAllText(AppFile("style.txt"), style == ArchStyle.Diagram ? "diagram" : "flow"); }
+            try { File.WriteAllText(AppFile("style.txt"), style == ArchStyle.Diagram ? "diagram" : style == ArchStyle.Iso ? "iso" : "flow"); }
             catch { }
         }
 
